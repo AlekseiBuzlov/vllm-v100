@@ -160,7 +160,8 @@ docker run --rm --gpus all nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi
 .
 ├── Dockerfile          # сборка llama.cpp из исходников, CUDA-бэкенд, arch sm_70
 ├── docker-compose.yml  # llama-server (порт 8000) + open-webui (порт 3000)
-├── .env                # модель/квант/токен (в .gitignore)
+├── models/             # положите сюда GGUF-веса (не в git, см. .gitignore)
+├── .env                # путь к модели / alias / API key (в .gitignore)
 └── .env.example        # шаблон
 ```
 
@@ -168,21 +169,40 @@ docker run --rm --gpus all nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi
 
 ## Запуск
 
-1. Подготовьте `.env`:
+1. Скачайте GGUF на хост (один раз, ~23 GB для Q5_K_M):
+
+```bash
+mkdir -p models
+curl -L -o models/qwen2.5-coder-32b-q5_k_m.gguf \
+  "https://huggingface.co/bartowski/Qwen2.5-Coder-32B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-32B-Instruct-Q5_K_M.gguf"
+```
+
+Для gated-репозиториев добавьте `-H "Authorization: Bearer $HF_TOKEN"`.
+Если модель разбита на части (`*-00001-of-0000N.gguf`), скачайте все шарды в
+`models/` и в `.env` укажите путь к **первому** файлу.
+
+Альтернатива Q5_K_M — Q4_K_M (~20 GB, чуть быстрее, чуть хуже качество):
+
+```bash
+curl -L -o models/qwen2.5-coder-32b-q4_k_m.gguf \
+  "https://huggingface.co/bartowski/Qwen2.5-Coder-32B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-32B-Instruct-Q4_K_M.gguf"
+```
+
+2. Подготовьте `.env` (путь внутри контейнера должен совпадать с именем файла в `models/`):
 
 ```bash
 cp .env.example .env
-# при желании укажите HF_TOKEN и/или поменяйте MODEL_QUANT (Q5_K_M / Q4_K_M)
+# при другом файле: MODEL_PATH=/models/ваш-файл.gguf
 ```
 
-2. Соберите образ (первая сборка llama.cpp из исходников занимает несколько минут)
+3. Соберите образ (первая сборка llama.cpp из исходников занимает несколько минут)
    и запустите:
 
 ```bash
 docker compose up -d --build
 ```
 
-3. Следите за загрузкой модели (первый запуск качает ~23 GB для Q5_K_M):
+4. Следите за загрузкой модели с диска в GPU:
 
 ```bash
 docker logs -f llama-server
@@ -354,7 +374,7 @@ nvidia-smi nvlink -gt d
 ```
 
 - **Квантизация модели** — `Q5_K_M` (качество, ~23 GB) ↔ `Q4_K_M` (скорость/запас, ~20 GB).
-  Меняется через `MODEL_QUANT` в `.env`.
+  Скачайте нужный GGUF в `models/` и укажите `MODEL_PATH` в `.env`.
 - **Контекст (`-c`)** — 32768 — нативный для модели. KV-cache для 32k влезает с запасом
   на 2×32 GB; при квантованном KV можно поднять до 65536.
 - **Параллелизм (`-np`)** — для кодинг-агентов оставьте `1` (полный контекст одному
@@ -378,51 +398,19 @@ nvidia-smi nvlink -gt d
 либо в `Dockerfile` замените оба `nvidia/cuda:12.1.0-*` на `nvidia/cuda:11.8.0-*`
 и пересоберите (`docker compose build --no-cache`).
 
-### `HTTPS is not supported` / `failed to load model ''`
+### `failed to load model` / пустой путь к модели
 
-В логах:
-
-```
-get_repo_commit: error: HTTPS is not supported. Please rebuild with -DLLAMA_OPENSSL=ON ...
-llama_model_load_from_file_impl: exactly one out metadata, path_model, and file must be defined
-load_model: failed to load model, ''
-```
-
-Это значит, что `llama-server` собран **без поддержки HTTPS**, поэтому `-hf` не может
-скачать модель (путь к модели остаётся пустым → `''`). Лечится пересборкой: в `Dockerfile`
-в build-стейдж добавлен `libssl-dev` и флаг `-DLLAMA_OPENSSL=ON`. Пересоберите без кэша:
+Проверьте, что файл существует на хосте и `MODEL_PATH` в `.env` указывает на него
+внутри контейнера (`/models/имя.gguf` ↔ `./models/имя.gguf` на хосте):
 
 ```bash
-docker compose build --no-cache
-docker compose up -d
+ls -lh models/
+grep MODEL_PATH .env
+docker compose config | grep -A1 '\-m'
 ```
 
-#### Запасной вариант: скачать GGUF вручную (без `-hf`)
-
-Если по какой-то причине загрузка через `-hf` недоступна, скачайте GGUF на хост и
-примонтируйте его как файл:
-
-```bash
-mkdir -p models
-# пример для Q5_K_M (файл может быть разбит на части *-00001-of-0000N.gguf)
-curl -L -H "Authorization: Bearer $HF_TOKEN" \
-  -o models/qwen2.5-coder-32b-q5_k_m.gguf \
-  "https://huggingface.co/bartowski/Qwen2.5-Coder-32B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-32B-Instruct-Q5_K_M.gguf"
-```
-
-Затем в `docker-compose.yml` примонтируйте папку и замените `-hf ...` на `-m`:
-
-```yaml
-    volumes:
-      - ./models:/models
-    command:
-      - -m
-      - /models/qwen2.5-coder-32b-q5_k_m.gguf
-      # (для разбитой модели укажите первый файл *-00001-of-0000N.gguf)
-      - --alias
-      - ${MODEL_ALIAS}
-      # ... остальные флаги без изменений
-```
+Типичные причины: файл не скачан, опечатка в имени, для шардов указан не первый
+`*-00001-of-*.gguf`.
 
 ### Контейнер не видит GPU
 
@@ -446,15 +434,15 @@ llama.cpp не использует NCCL, но использует CUDA P2P. Е
 ### Не хватает VRAM (OOM)
 
 Уменьшите контекст (`-c 16384`), включите квантованный KV-cache (см. тюнинг),
-или перейдите на `MODEL_QUANT=Q4_K_M`.
+или скачайте более лёгкий квант (Q4_K_M) и обновите `MODEL_PATH`.
 
 ---
 
 ## Остановка
 
 ```bash
-docker compose down          # volumes сохраняются (кэш модели + данные UI)
-docker compose down -v       # также удалить volumes (перекачка модели заново)
+docker compose down          # volumes Open WebUI сохраняются
+docker compose down -v       # также удалить данные Open WebUI
 ```
 
 ---

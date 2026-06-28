@@ -22,30 +22,25 @@ services:
       NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
       CUDA_VISIBLE_DEVICES: "0,1"
 
-      # Optional: HF token to avoid download rate limits / for gated repos.
-      HF_TOKEN: ${HF_TOKEN}
-
-      # Where -hf downloads are cached (mapped to a named volume below).
-      LLAMA_CACHE: /root/.cache/llama.cpp
-
       # If P2P/NVLink copies misbehave on your box, set this to "1" (slower):
       # GGML_CUDA_NO_PEER_COPY: "0"
 
     volumes:
-      - llama-cache:/root/.cache/llama.cpp
+      # GGUF weights on the host -> /models inside the container (read-only).
+      - ${MODEL_HOST_DIR:-./models}:/models:ro
 
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 30
-      # First run downloads ~23 GB (Q5_K_M); give it plenty of time.
-      start_period: 1800s
+      # Loading ~23 GB GGUF into GPU memory can take several minutes.
+      start_period: 600s
 
     command:
-      # ----- model: GGUF auto-downloaded from Hugging Face -----
-      - -hf
-      - ${MODEL_REPO}:${MODEL_QUANT}
+      # ----- model: local GGUF file (path inside container) -----
+      - -m
+      - ${MODEL_PATH}
       # Short, stable name exposed via the OpenAI API ("model" field).
       - --alias
       - ${MODEL_ALIAS}
@@ -108,5 +103,4 @@ services:
       - open-webui-data:/app/backend/data
 
 volumes:
-  llama-cache:
   open-webui-data:
