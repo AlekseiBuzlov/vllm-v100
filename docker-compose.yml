@@ -54,8 +54,6 @@ services:
       # Qwen2.5-Coder uses the Hermes 2 Pro tool-call format via its GGUF
       # chat template; without --jinja calls leak as plain text in the reply.
       - --jinja
-      - --api-key
-      - ${API_KEY:-local-key}
 
       # ----- GPU / multi-GPU -----
       # Offload ALL transformer layers to GPU (no CPU offload). 99 = "all".
