@@ -1,0 +1,99 @@
+services:
+  qwen-vllm:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: qwen-vllm
+    restart: unless-stopped
+
+    # 2 x V100
+    gpus: all
+    ipc: host
+    shm_size: "32gb"
+
+    ports:
+      - "8000:8000"
+
+    environment:
+      HF_TOKEN: ${HF_TOKEN}
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN}
+      NVIDIA_VISIBLE_DEVICES: "0,1"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+
+      # For 2 GPUs over NVLink this is usually fine.
+      # If NCCL errors appear, see the troubleshooting section in README.md.
+      NCCL_DEBUG: "WARN"
+      NCCL_P2P_DISABLE: "0"
+
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://localhost:8000/health').status==200 else sys.exit(1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 600s
+
+    command:
+      - ${MODEL_ID}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+
+      # Important for V100: Qwen may try bf16/auto, we need fp16.
+      - --dtype
+      - half
+
+      # Spread the model across both cards.
+      - --tensor-parallel-size
+      - "2"
+
+      # Int8 GPTQ is usually read from the model's quantization_config,
+      # but we set it explicitly in case auto-detection doesn't pick it up.
+      # If it fails on quantization, remove these two lines (see README.md).
+      - --quantization
+      - gptq
+
+      # Keep KV-cache from blowing up VRAM at startup.
+      # Can be raised to 32768 later if it runs stably.
+      - --max-model-len
+      - "16384"
+
+      # Keep memory usage moderate at startup.
+      - --gpu-memory-utilization
+      - "0.88"
+
+      # Enough for a test UI.
+      - --max-num-seqs
+      - "4"
+
+      # So Open WebUI sees a short model name.
+      - --served-model-name
+      - qwen2.5-coder-32b-int8
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    restart: unless-stopped
+    depends_on:
+      qwen-vllm:
+        condition: service_healthy
+
+    ports:
+      - "3000:8080"
+
+    environment:
+      OPENAI_API_BASE_URL: http://qwen-vllm:8000/v1
+      OPENAI_API_KEY: local-key
+
+      # Convenient for local testing. Enable auth if exposed externally.
+      WEBUI_AUTH: "false"
+
+    volumes:
+      - open-webui-data:/app/backend/data
+
+volumes:
+  hf-cache:
+  open-webui-data:
