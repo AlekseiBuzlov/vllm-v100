@@ -225,24 +225,72 @@ curl http://localhost:8000/v1/chat/completions \
   }'
 ```
 
+### Tool calling (агенты в VSCode)
+
+Сервер запускается с `--jinja`: llama.cpp использует Jinja2 chat template из GGUF
+и отдаёт OpenAI-style function calling (`tools` в `/v1/chat/completions`).
+Qwen2.5-Coder-32B поддерживает нативный формат **Hermes 2 Pro** — без `--jinja`
+вызовы тулов попадают в текст ответа и агент их не выполняет.
+
+Проверка после `docker compose up`:
+
+```bash
+curl http://localhost:8000/props | jq '.default_generation_settings.chat_template_caps'
+# ожидайте tool_use / parallel_tool_calls в caps
+
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer local-key" \
+  -d '{
+    "model": "qwen2.5-coder-32b",
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get weather for a city",
+        "parameters": {
+          "type": "object",
+          "properties": { "city": { "type": "string" } },
+          "required": ["city"]
+        }
+      }
+    }],
+    "messages": [{ "role": "user", "content": "What is the weather in Moscow?" }]
+  }'
+```
+
+В ответе должен быть `tool_calls`, а не сырой XML в `content`.
+
 ### Подключение клиентов
 
 - **Open WebUI** — уже настроен через `OPENAI_API_BASE_URL` в compose.
-- **Continue** (`config.json`):
+- **Continue** (Agent mode, `~/.continue/config.yaml`):
 
-```json
-{
-  "models": [
-    {
-      "title": "Qwen2.5-Coder-32B (V100)",
-      "provider": "openai",
-      "model": "qwen2.5-coder-32b",
-      "apiBase": "http://<host>:8000/v1",
-      "apiKey": "local-key"
-    }
-  ]
-}
+```yaml
+name: Qwen V100
+version: 0.0.1
+schema: v1
+
+models:
+  - name: Qwen2.5-Coder-32B (V100)
+    provider: openai
+    model: qwen2.5-coder-32b
+    apiBase: http://<host>:8000/v1
+    apiKey: local-key
+    capabilities:
+      - tool_use
+    roles:
+      - chat
+      - edit
+      - apply
 ```
+
+`capabilities: [tool_use]` нужен, чтобы Continue включил Agent mode и запуск
+тулов (чтение файлов, терминал и т.д.) в VSCode.
+
+- **Cline** — провайдер «OpenAI Compatible», Base URL `http://<host>:8000/v1`,
+  API key `local-key`, model `qwen2.5-coder-32b`. Включите режим с tools/act mode;
+  сервер уже отдаёт function calling через `--jinja`.
 
 - **Aider**:
 
@@ -251,9 +299,6 @@ export OPENAI_API_BASE=http://<host>:8000/v1
 export OPENAI_API_KEY=local-key
 aider --model openai/qwen2.5-coder-32b
 ```
-
-- **Cline** — провайдер «OpenAI Compatible», Base URL `http://<host>:8000/v1`,
-  API key `local-key`, model `qwen2.5-coder-32b`.
 
 ---
 
