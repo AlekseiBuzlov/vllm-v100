@@ -333,6 +333,52 @@ nvidia-smi nvlink -gt d
 либо в `Dockerfile` замените оба `nvidia/cuda:12.1.0-*` на `nvidia/cuda:11.8.0-*`
 и пересоберите (`docker compose build --no-cache`).
 
+### `HTTPS is not supported` / `failed to load model ''`
+
+В логах:
+
+```
+get_repo_commit: error: HTTPS is not supported. Please rebuild with -DLLAMA_OPENSSL=ON ...
+llama_model_load_from_file_impl: exactly one out metadata, path_model, and file must be defined
+load_model: failed to load model, ''
+```
+
+Это значит, что `llama-server` собран **без поддержки HTTPS**, поэтому `-hf` не может
+скачать модель (путь к модели остаётся пустым → `''`). Лечится пересборкой: в `Dockerfile`
+в build-стейдж добавлен `libssl-dev` и флаг `-DLLAMA_OPENSSL=ON`. Пересоберите без кэша:
+
+```bash
+docker compose build --no-cache
+docker compose up -d
+```
+
+#### Запасной вариант: скачать GGUF вручную (без `-hf`)
+
+Если по какой-то причине загрузка через `-hf` недоступна, скачайте GGUF на хост и
+примонтируйте его как файл:
+
+```bash
+mkdir -p models
+# пример для Q5_K_M (файл может быть разбит на части *-00001-of-0000N.gguf)
+curl -L -H "Authorization: Bearer $HF_TOKEN" \
+  -o models/qwen2.5-coder-32b-q5_k_m.gguf \
+  "https://huggingface.co/bartowski/Qwen2.5-Coder-32B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-32B-Instruct-Q5_K_M.gguf"
+```
+
+Затем в `docker-compose.yml` примонтируйте папку и замените `-hf ...` на `-m`:
+
+```yaml
+    volumes:
+      - ./models:/models
+    command:
+      - -m
+      - /models/qwen2.5-coder-32b-q5_k_m.gguf
+      # (для разбитой модели укажите первый файл *-00001-of-0000N.gguf)
+      - --alias
+      - ${MODEL_ALIAS}
+      # ... остальные флаги без изменений
+```
+
 ### Контейнер не видит GPU
 
 Проверьте NVIDIA Container Toolkit:
