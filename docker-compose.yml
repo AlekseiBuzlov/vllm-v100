@@ -1,93 +1,100 @@
 services:
-  qwen-vllm:
+  llama-server:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: qwen-vllm
+      args:
+        # Pin to a release tag (e.g. b4400) for reproducible builds if desired.
+        LLAMA_CPP_REF: ${LLAMA_CPP_REF:-master}
+    image: llama-cpp-cuda-sm70:local
+    container_name: llama-server
     restart: unless-stopped
 
-    # 2 x V100
+    # Expose both V100s to the container.
     gpus: all
-    ipc: host
-    shm_size: "32gb"
 
     ports:
       - "8000:8000"
 
     environment:
-      HF_TOKEN: ${HF_TOKEN}
-      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN}
+      # Use both GPUs, index 0 and 1.
       NVIDIA_VISIBLE_DEVICES: "0,1"
       NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+      CUDA_VISIBLE_DEVICES: "0,1"
 
-      # For 2 GPUs over NVLink this is usually fine.
-      # If NCCL errors appear, see the troubleshooting section in README.md.
-      NCCL_DEBUG: "WARN"
-      NCCL_P2P_DISABLE: "0"
+      # Optional: HF token to avoid download rate limits / for gated repos.
+      HF_TOKEN: ${HF_TOKEN}
+
+      # Where -hf downloads are cached (mapped to a named volume below).
+      LLAMA_CACHE: /root/.cache/llama.cpp
+
+      # If P2P/NVLink copies misbehave on your box, set this to "1" (slower):
+      # GGML_CUDA_NO_PEER_COPY: "0"
 
     volumes:
-      - hf-cache:/root/.cache/huggingface
+      - llama-cache:/root/.cache/llama.cpp
 
     healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://localhost:8000/health').status==200 else sys.exit(1)"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
-      retries: 20
-      start_period: 600s
+      retries: 30
+      # First run downloads ~23 GB (Q5_K_M); give it plenty of time.
+      start_period: 1800s
 
     command:
-      - ${MODEL_ID}
+      # ----- model: GGUF auto-downloaded from Hugging Face -----
+      - -hf
+      - ${MODEL_REPO}:${MODEL_QUANT}
+      # Short, stable name exposed via the OpenAI API ("model" field).
+      - --alias
+      - ${MODEL_ALIAS}
+
+      # ----- network / OpenAI-compatible API -----
       - --host
       - 0.0.0.0
       - --port
       - "8000"
 
-      # Important for V100: Qwen may try bf16/auto, we need fp16.
-      - --dtype
-      - half
+      # ----- GPU / multi-GPU -----
+      # Offload ALL transformer layers to GPU (no CPU offload). 99 = "all".
+      - -ngl
+      - "99"
+      # Split the model evenly across the two V100s (balanced VRAM).
+      - -ts
+      - "1,1"
+      # Split mode:
+      #   layer (default here) -> split by layers, lowest inter-GPU traffic, best
+      #                           single-stream throughput.
+      #   row                  -> split tensors across GPUs (tensor-parallel-like),
+      #                           uses NVLink heavily; try it for latency.
+      - -sm
+      - layer
 
-      # Spread the model across both cards.
-      - --tensor-parallel-size
-      - "2"
-
-      # Int8 GPTQ is usually read from the model's quantization_config,
-      # but we set it explicitly in case auto-detection doesn't pick it up.
-      # If it fails on quantization, remove these two lines (see README.md).
-      - --quantization
-      - gptq
-
-      # Keep KV-cache from blowing up VRAM at startup.
-      # Can be raised to 32768 later if it runs stably.
-      - --max-model-len
-      - "16384"
-
-      # Keep memory usage moderate at startup.
-      - --gpu-memory-utilization
-      - "0.88"
-
-      # Enough for a test UI.
-      - --max-num-seqs
-      - "4"
-
-      # So Open WebUI sees a short model name.
-      - --served-model-name
-      - qwen2.5-coder-32b-int8
+      # ----- context / batching -----
+      # Qwen2.5-Coder-32B native context is 32768. Plenty of VRAM headroom here.
+      - -c
+      - "32768"
+      # Single full-context slot (good for coding agents). Raise for concurrency.
+      - -np
+      - "1"
+      - --cont-batching
+      - --metrics
 
   open-webui:
     image: ghcr.io/open-webui/open-webui:main
     container_name: open-webui
     restart: unless-stopped
     depends_on:
-      qwen-vllm:
+      llama-server:
         condition: service_healthy
 
     ports:
       - "3000:8080"
 
     environment:
-      OPENAI_API_BASE_URL: http://qwen-vllm:8000/v1
+      OPENAI_API_BASE_URL: http://llama-server:8000/v1
       OPENAI_API_KEY: local-key
-
       # Convenient for local testing. Enable auth if exposed externally.
       WEBUI_AUTH: "false"
 
@@ -95,5 +102,5 @@ services:
       - open-webui-data:/app/backend/data
 
 volumes:
-  hf-cache:
+  llama-cache:
   open-webui-data:

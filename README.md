@@ -1,13 +1,92 @@
-# vLLM + Qwen2.5-Coder-32B на 2× Tesla V100
+# llama.cpp + Qwen2.5-Coder-32B на 2× Tesla V100 (SM70)
 
-Запуск [Qwen/Qwen2.5-Coder-32B-Instruct-GPTQ-Int8](https://huggingface.co/Qwen/Qwen2.5-Coder-32B-Instruct-GPTQ-Int8)
-через vLLM (OpenAI-compatible API) и [Open WebUI](https://github.com/open-webui/open-webui)
-на двух GPU NVIDIA Tesla V100 (32 GB).
+OpenAI-совместимый инференс [Qwen2.5-Coder-32B-Instruct](https://huggingface.co/Qwen/Qwen2.5-Coder-32B-Instruct)
+в формате **GGUF** через **llama.cpp (`llama-server`)** с CUDA-бэкендом, собранным
+специально под **NVIDIA Tesla V100 SXM2 32 GB (Volta, compute capability 7.0 / sm_70)**.
+Плюс [Open WebUI](https://github.com/open-webui/open-webui) для удобного UI.
+
+API совместим с Continue, Cline, Aider и Open WebUI:
+
+```
+POST http://<host>:8000/v1/chat/completions
+```
+
+---
+
+## Почему не vLLM (объяснение проблемы)
+
+Текущий деплой на vLLM падал, потому что современные сборки PyTorch/vLLM **больше не
+содержат kernels для Volta (sm_70)**. Бинарь PyTorch скомпилирован только под:
+
+```
+sm_75, sm_80, sm_86, sm_90, sm_100, sm_120
+```
+
+V100 — это `sm_70`, поэтому нужных kernels просто нет. Отсюда и вся цепочка ошибок:
+
+```
+NCCL internal error
+Failed to find reverse path
+WorkerProc failed to start
+Engine core initialization failed
+```
+
+Это **следствия**, а не причина: воркеры не стартуют, потому что под GPU нет кода.
+
+### Почему llama.cpp (Вариант A, выбранный)
+
+- **Нет зависимости от PyTorch.** llama.cpp компилирует собственные CUDA-kernels.
+- Мы фиксируем `CMAKE_CUDA_ARCHITECTURES=70`, то есть бинарь содержит **реальные sm_70 kernels** для V100.
+- **Не использует NCCL.** Мульти-GPU работает через собственный CUDA peer-to-peer (по NVLink). Тех ошибок NCCL больше не будет.
+- Отличная и стабильная поддержка Volta, простой деплой.
+- Один минус: на V100 это «рабочий», а не «топовый» по скорости инференс (нет fast-kernels уровня A100/H100), но для кодинга это вполне usable.
+
+> Вариант B (остаться на vLLM) описан в конце файла — он сложнее и хрупче, поэтому не рекомендуется.
+
+---
+
+## Диагностика текущего окружения
+
+Прежде чем менять стек, полезно зафиксировать, что было (и проверить драйвер хоста).
+
+На хосте:
+
+```bash
+nvidia-smi                       # модель GPU + версия драйвера + CUDA driver API
+nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
+nvidia-smi topo -m               # топология: между двумя V100 должны быть NV# (NVLink)
+```
+
+Если у вас ещё запущен старый vLLM-контейнер — версии внутри него:
+
+```bash
+docker ps
+docker exec <vllm_container> python -c "import torch, vllm; \
+  print('torch', torch.__version__); \
+  print('vllm', vllm.__version__); \
+  print('cuda', torch.version.cuda); \
+  print('arch_list', torch.cuda.get_arch_list())"   # тут НЕ будет sm_70
+docker exec <vllm_container> nvidia-smi
+```
+
+`torch.cuda.get_arch_list()` без `sm_70` — это и есть подтверждение корневой причины.
+
+---
+
+## Требования к хосту
+
+1. **NVIDIA-драйвер** для CUDA 12.1 (используется в образе) — `>= 525.60.13`.
+   Проверка: `nvidia-smi` (поле *Driver Version*).
+   Если драйвер старее — в `Dockerfile` поменяйте оба базовых образа с `12.1.0` на `11.8.0`.
+2. **Docker** + **Docker Compose plugin** (см. установку ниже).
+3. **NVIDIA Container Toolkit** (проброс GPU в контейнеры).
+
+---
 
 ## Установка Docker и Docker Compose
 
-Инструкции ниже — для Ubuntu / Debian в CLI. На сервере с V100 обычно стоит Ubuntu 22.04 или 24.04.
-Для других дистрибутивов см. [официальную документацию Docker](https://docs.docker.com/engine/install/).
+Инструкции для Ubuntu / Debian в CLI. Для других дистрибутивов см.
+[официальную документацию Docker](https://docs.docker.com/engine/install/).
 
 ### Проверка, установлен ли Docker
 
@@ -16,26 +95,21 @@ docker --version
 docker compose version
 ```
 
-Если обе команды отрабатывают — этот раздел можно пропустить и перейти к [запуску](#запуск).
+Если обе команды отрабатывают — переходите к [NVIDIA Container Toolkit](#nvidia-container-toolkit-обязательно-для-gpu).
 
 ### Docker Engine + Compose plugin (Ubuntu / Debian)
-
-Современный `docker compose` ставится как плагин вместе с Docker Engine — отдельный бинарник `docker-compose` не нужен.
 
 ```bash
 # Удалить старые пакеты, если были
 sudo apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
 
-# Зависимости
 sudo apt-get update
 sudo apt-get install -y ca-certificates curl gnupg
 
-# GPG-ключ Docker
 sudo install -m 0755 -d /etc/apt/keyrings
 curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
 sudo chmod a+r /etc/apt/keyrings/docker.gpg
 
-# Репозиторий Docker
 # Для Debian замените "ubuntu" на "debian" в URL ниже
 echo \
   "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
@@ -46,24 +120,15 @@ sudo apt-get update
 sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 ```
 
-Запуск Docker без `sudo` (нужен повторный вход в SSH-сессию после команды):
+Запуск без `sudo` (нужен повторный вход в SSH-сессию):
 
 ```bash
 sudo usermod -aG docker "$USER"
 newgrp docker
-```
-
-Проверка:
-
-```bash
 docker run --rm hello-world
-docker compose version
 ```
 
 ### NVIDIA Container Toolkit (обязательно для GPU)
-
-Без него контейнеры не увидят видеокарты. Подробнее:
-[NVIDIA Container Toolkit — install guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
 
 ```bash
 curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
@@ -75,84 +140,83 @@ curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-contai
 
 sudo apt-get update
 sudo apt-get install -y nvidia-container-toolkit
-
 sudo nvidia-ctk runtime configure --runtime=docker
 sudo systemctl restart docker
 ```
 
-Проверка проброса GPU в контейнер:
+Проверка проброса обеих V100 в контейнер:
 
 ```bash
-docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
+docker run --rm --gpus all nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi
 ```
 
-Должен вывестись список GPU (в т.ч. две V100).
+В выводе должны быть **две** Tesla V100.
 
-## Почему GPTQ Int8 на V100?
-
-V100 — это Volta (compute capability 7.0). vLLM поддерживает **GPTQ** на Volta, но **не**
-поддерживает AWQ / FP8 / Marlin kernels. Поэтому GPTQ Int8 здесь — правильный выбор; AWQ на V100 лучше не использовать.
-
-- `--dtype half` (fp16) обязателен: у V100 нет быстрого пути для BF16.
-- `--tensor-parallel-size 2` практически обязателен: Int8-модель весит ~33 GB, а одна
-  V100 имеет 32 GB, плюс нужны KV-cache и служебная память.
-- Ожидайте *рабочий*, но не «современно быстрый» инференс: быстрый Marlin kernel для GPTQ/AWQ/FP8
-  на Volta не поддерживается, поэтому пропускная способность заметно ниже, чем на A100/4090/H100.
+---
 
 ## Файлы
 
 ```
 .
-├── Dockerfile          # vllm/vllm-openai:latest с env для HF cache
-├── docker-compose.yml  # qwen-vllm (порт 8000) + open-webui (порт 3000)
-├── .env                # HF_TOKEN + MODEL_ID (в .gitignore)
+├── Dockerfile          # сборка llama.cpp из исходников, CUDA-бэкенд, arch sm_70
+├── docker-compose.yml  # llama-server (порт 8000) + open-webui (порт 3000)
+├── .env                # модель/квант/токен (в .gitignore)
 └── .env.example        # шаблон
 ```
 
+---
+
 ## Запуск
 
-1. Скопируйте шаблон env и отредактируйте его:
+1. Подготовьте `.env`:
 
 ```bash
 cp .env.example .env
-# затем укажите HF token в .env (для публичных моделей необязательно, но помогает избежать rate limit)
+# при желании укажите HF_TOKEN и/или поменяйте MODEL_QUANT (Q5_K_M / Q4_K_M)
 ```
 
-2. Убедитесь, что Docker видит GPU (см. [проверку выше](#nvidia-container-toolkit-обязательно-для-gpu)):
-
-```bash
-docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
-```
-
-3. Соберите и запустите:
+2. Соберите образ (первая сборка llama.cpp из исходников занимает несколько минут)
+   и запустите:
 
 ```bash
 docker compose up -d --build
 ```
 
-4. Следите за загрузкой модели (первый запуск скачает ~33 GB):
+3. Следите за загрузкой модели (первый запуск качает ~23 GB для Q5_K_M):
 
 ```bash
-docker logs -f qwen-vllm
+docker logs -f llama-server
 ```
+
+Дождитесь строк вида:
+
+```
+load_tensors: offloaded 65/65 layers to GPU
+...
+main: server is listening on http://0.0.0.0:8000
+```
+
+`offloaded 65/65 layers to GPU` означает, что CPU-offload нет — всё на GPU.
+
+---
 
 ## Доступ
 
 - Open WebUI: http://localhost:3000
-- vLLM API (напрямую):
+- API llama.cpp (OpenAI-совместимый):
 
 ```bash
 curl http://localhost:8000/v1/models
 ```
 
-- Тестовый chat completion:
+Тестовый запрос:
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer local-key" \
   -d '{
-    "model": "qwen2.5-coder-32b-int8",
+    "model": "qwen2.5-coder-32b",
     "messages": [
       { "role": "user", "content": "Write a NestJS service with Redis cache for user profiles." }
     ],
@@ -161,68 +225,152 @@ curl http://localhost:8000/v1/chat/completions \
   }'
 ```
 
-## Настройка
+### Подключение клиентов
 
-- `--max-model-len 16384` — безопасный старт. Если модель загрузилась и `nvidia-smi` показывает свободную память,
-  можно попробовать `32768`. Контекст 131k для 32B-модели на 2× V100 32 GB почти наверняка
-  не влезет из-за KV-cache.
-- Для кодинга в UI начинайте с `max_tokens` 1024–2048, контекст 16k, temperature 0.1–0.3.
+- **Open WebUI** — уже настроен через `OPENAI_API_BASE_URL` в compose.
+- **Continue** (`config.json`):
 
-## Диагностика
-
-### Падает на quantization
-
-Пусть vLLM возьмёт quantization из `quantization_config` модели — уберите явный флаг
-в `docker-compose.yml`:
-
-```yaml
-      - --dtype
-      - half
-      - --tensor-parallel-size
-      - "2"
-      - --max-model-len
-      - "16384"
+```json
+{
+  "models": [
+    {
+      "title": "Qwen2.5-Coder-32B (V100)",
+      "provider": "openai",
+      "model": "qwen2.5-coder-32b",
+      "apiBase": "http://<host>:8000/v1",
+      "apiKey": "local-key"
+    }
+  ]
+}
 ```
 
-(то есть удалите строки `--quantization` / `gptq`).
-
-### Ошибки NCCL / NVLink
-
-Проверьте топологию — между GPU должны быть связи `NV1` / `NV2`:
+- **Aider**:
 
 ```bash
-nvidia-smi topo -m
+export OPENAI_API_BASE=http://<host>:8000/v1
+export OPENAI_API_KEY=local-key
+aider --model openai/qwen2.5-coder-32b
 ```
 
-Временные диагностические переменные окружения для сервиса `qwen-vllm`:
+- **Cline** — провайдер «OpenAI Compatible», Base URL `http://<host>:8000/v1`,
+  API key `local-key`, model `qwen2.5-coder-32b`.
 
-```yaml
-environment:
-  NCCL_DEBUG: "INFO"
-  NCCL_P2P_DISABLE: "0"
-  NCCL_IB_DISABLE: "1"
-```
+---
 
-Если всё равно не стартует, можно отключить P2P (будет медленнее):
+## Проверка мульти-GPU, NVLink и баланса VRAM
 
-```yaml
-  NCCL_P2P_DISABLE: "1"
-```
-
-### Образ `latest` не стартует (CUDA/драйвер)
-
-`vllm/vllm-openai:latest` может требовать свежий NVIDIA driver. При ошибке
-`CUDA driver version is insufficient` обновите драйвер на хосте или зафиксируйте более старый
-образ vLLM. Быстрая проверка:
+1. Обе карты заняты и VRAM сбалансирован (≈поровну):
 
 ```bash
-nvidia-smi
-docker run --rm --gpus all vllm/vllm-openai:latest nvidia-smi
+watch -n 1 nvidia-smi
+# во время инференса обе V100 показывают занятую память и периодическую загрузку
 ```
+
+2. Логи llama-server подтверждают распределение по двум устройствам:
+
+```bash
+docker logs llama-server | grep -Ei "CUDA0|CUDA1|buffer size|offloaded"
+# должны быть и CUDA0, и CUDA1 с примерно равными буферами весов/KV-cache
+```
+
+3. NVLink присутствует и используется:
+
+```bash
+nvidia-smi topo -m            # между GPU0 и GPU1 должно быть NV# (а не SYS/PHB)
+nvidia-smi nvlink -s          # статус линков (Active)
+# счётчики трафика по NVLink (растут при -sm row сильнее, чем при -sm layer):
+nvidia-smi nvlink -gt d
+```
+
+4. CPU-offload отсутствует: в логах `offloaded 65/65 layers to GPU` и `-ngl 99` в команде.
+
+---
+
+## Тюнинг производительности
+
+- **Split mode (`-sm`)** — главный рычаг под NVLink:
+  - `layer` (по умолчанию) — деление по слоям, минимум межкарточного трафика,
+    обычно лучший throughput для одного потока.
+  - `row` — деление тензоров по строкам между GPU (ближе к tensor parallelism),
+    активно использует NVLink, может снизить latency. Попробуйте:
+    в `docker-compose.yml` замените `-sm layer` на `-sm row`.
+- **Баланс VRAM (`-ts`)** — `1,1` делит поровну. Если одна карта подгружена
+  чем-то ещё, сместите, например `-ts 6,4`.
+- **Flash Attention + квантованный KV-cache** — экономит память KV и даёт более
+  длинный контекст. На V100 включайте аккуратно (проверьте, что стартует):
+
+```yaml
+      - -fa
+      - "on"
+      - --cache-type-k
+      - q8_0
+      - --cache-type-v
+      - q8_0
+```
+
+- **Квантизация модели** — `Q5_K_M` (качество, ~23 GB) ↔ `Q4_K_M` (скорость/запас, ~20 GB).
+  Меняется через `MODEL_QUANT` в `.env`.
+- **Контекст (`-c`)** — 32768 — нативный для модели. KV-cache для 32k влезает с запасом
+  на 2×32 GB; при квантованном KV можно поднять до 65536.
+- **Параллелизм (`-np`)** — для кодинг-агентов оставьте `1` (полный контекст одному
+  запросу). Для нескольких пользователей увеличьте, но `-c` делится между слотами.
+- **Запас памяти**: Q5_K_M (~23 GB весов) делится ≈11.5 GB на карту, остаётся
+  ~20 GB на карту под KV-cache и буферы — это и позволяет CPU-offload не включать.
+- Для разумных ответов в кодинге: `temperature` 0.1–0.3, `max_tokens` 1024–2048.
+
+---
+
+## Диагностика проблем
+
+### Сборка падает / долгая
+
+Первая сборка llama.cpp из исходников — это нормально несколько минут. Чтобы
+зафиксировать версию и кэшировать, задайте тег в `.env`: `LLAMA_CPP_REF=b4400`.
+
+### `CUDA driver version is insufficient`
+
+Драйвер хоста старее, чем требует CUDA 12.1. Либо обновите драйвер (`>= 525.60.13`),
+либо в `Dockerfile` замените оба `nvidia/cuda:12.1.0-*` на `nvidia/cuda:11.8.0-*`
+и пересоберите (`docker compose build --no-cache`).
+
+### Контейнер не видит GPU
+
+Проверьте NVIDIA Container Toolkit:
+
+```bash
+docker run --rm --gpus all nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi
+```
+
+Если тут пусто/ошибка — переустановите toolkit и `sudo systemctl restart docker`.
+
+### Проблемы с P2P/NVLink-копированием
+
+llama.cpp не использует NCCL, но использует CUDA P2P. Если видите подвисания/ошибки
+копий между GPU, отключите P2P (станет медленнее) — раскомментируйте в `docker-compose.yml`:
+
+```yaml
+      GGML_CUDA_NO_PEER_COPY: "1"
+```
+
+### Не хватает VRAM (OOM)
+
+Уменьшите контекст (`-c 16384`), включите квантованный KV-cache (см. тюнинг),
+или перейдите на `MODEL_QUANT=Q4_K_M`.
+
+---
 
 ## Остановка
 
 ```bash
 docker compose down          # volumes сохраняются (кэш модели + данные UI)
-docker compose down -v       # также удалить volumes
+docker compose down -v       # также удалить volumes (перекачка модели заново)
 ```
+
+---
+
+## Вариант B (НЕ рекомендуется): остаться на vLLM
+
+Если vLLM обязателен, нужен **старый** стек с поддержкой sm_70: образ с CUDA 11.8/12.1
+и PyTorch, собранным с `sm_70` (например, vLLM `v0.4.x`–`v0.6.x` эпохи CUDA 12.1 +
+torch 2.1–2.3). Избегайте `:latest`, nightly и сборок на CUDA 13. Это заметно
+сложнее в поддержке и более хрупко, чем llama.cpp, поэтому рекомендуется Вариант A.
